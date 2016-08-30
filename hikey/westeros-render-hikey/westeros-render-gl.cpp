@@ -35,7 +35,7 @@
 
 #include <vector>
 
-#SIVA: DRM support 
+//SIVA: DRM support 
 #define DRM
 
 #ifdef DRM
@@ -220,11 +220,8 @@ typedef struct _WstRendererGL
 } WstRendererGL;
 
 #ifdef DRM
-struct drm{
-    int fd;
-//    crtc_id;
-};
-
+extern "C"
+{
 struct drm_backend {
 /*        struct weston_backend base;
         struct weston_compositor *compositor;
@@ -266,11 +263,68 @@ struct drm_backend {
 
         uint32_t prev_state;
 
-        struct udev_input input;
+//        struct udev_input input;
 
         int32_t cursor_width;
         int32_t cursor_height;
 };
+
+struct drm_edid {
+	char eisa_id[13];
+	char monitor_name[13];
+	char pnp_id[5];
+	char serial_number[13];
+};
+
+struct drm_output {
+	uint32_t crtc_id;
+	int pipe;
+	uint32_t connector_id;
+	drmModeCrtcPtr original_crtc;
+	struct drm_edid edid;
+	drmModePropertyPtr dpms_prop;
+	uint32_t format;
+
+//	enum dpms_enum dpms;
+
+	int vblank_pending;
+	int page_flip_pending;
+	int destroy_pending;
+
+	struct gbm_surface *surface;
+	struct gbm_bo *cursor_bo[2];
+	int current_cursor;
+	struct drm_fb *current, *next;
+	struct backlight *backlight;
+
+	struct drm_fb *dumb[2];
+//	pixman_image_t *image[2];
+	int current_image;
+//	pixman_region32_t previous_damage;
+
+	struct vaapi_recorder *recorder;
+	struct wl_listener recorder_frame_listener;
+};
+
+struct drm_fb {
+	struct drm_output *output;
+	uint32_t fb_id, stride, handle, size;
+	int fd;
+	int is_client_buffer;
+//	struct weston_buffer_reference buffer_ref;
+
+	/* Used by gbm fbs */
+	struct gbm_bo *bo;
+
+	/* Used by dumb fbs */
+	void *map;
+};
+
+static int create_output(struct drm_backend *b,
+                            drmModeRes *resources,
+                            drmModeConnector *connector,
+                            int x, int y);
+}
 #endif
 
 static WstRendererGL* wstRendererGLCreate( int width, int height );
@@ -305,9 +359,24 @@ static WstShader* wstCreateShaderForClass( WstShaderClass shaderClass );
 static void wstDestroyShader( WstRendererGL *renderer, WstShader *shader );
 static unsigned int wstCreateGLShader(const char *pShaderSource, bool isVertexShader );
 
+#ifdef DRM
+   struct drm_backend *b;
+   struct drm_output *output;
+#endif
+
 static WstRendererGL* wstRendererGLCreate( WstRenderer *renderer )
 {
    WstRendererGL *rendererGL= 0;
+
+#ifdef DRM
+   int ret;
+   uint64_t cap;   
+   b = (struct drm_backend*)calloc(1, sizeof(b));
+
+   if(!b)
+        printf("DRM backend is null\n");
+   b->format = GBM_FORMAT_XRGB8888;
+#endif
    
    rendererGL= (WstRendererGL*)calloc(1, sizeof(WstRendererGL) );
    if ( rendererGL )
@@ -323,6 +392,22 @@ static WstRendererGL* wstRendererGLCreate( WstRenderer *renderer )
       
       rendererGL->renderer= renderer;
       wstRenderGLSetupEGL( rendererGL );
+
+#ifdef DRM
+     b->drm.filename = "/dev/dri/card0";
+
+        ret = drmGetCap(b->drm.fd, DRM_CAP_CURSOR_WIDTH, &cap);
+        if (ret == 0)
+                b->cursor_width = cap;
+        else
+                b->cursor_width = 64;
+
+        ret = drmGetCap(b->drm.fd, DRM_CAP_CURSOR_HEIGHT, &cap);
+        if (ret == 0)
+                b->cursor_height = cap;
+        else
+                b->cursor_height = 64;
+#endif
 
       rendererGL->eglCreateImageKHR= (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
       printf( "eglCreateImageKHR %p\n", rendererGL->eglCreateImageKHR);
@@ -1486,7 +1571,7 @@ static bool wstRenderGLSetupEGL( WstRendererGL *renderer )
 {
    bool result= false;
    EGLint major, minor;
-   EGLBoolean b;
+   EGLBoolean b1;
    EGLint configCount;
    EGLConfig *eglConfigs= 0;
    EGLint attr[32];
@@ -1509,23 +1594,29 @@ static bool wstRenderGLSetupEGL( WstRendererGL *renderer )
    else
    {
 #if 1
+     int fd;
         char s[64];
 static PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display = NULL;
     struct gbm_device *gbm;
     int supports = 0;
         EGLenum platform = EGL_PLATFORM_GBM_KHR;
 
-        drm.fd = open("/dev/dri/card0", O_RDWR | FD_CLOEXEC);
-        if (drm.fd < 0) {
+        fd = open("/dev/dri/card0", O_RDWR | FD_CLOEXEC);
+        if (fd < 0) {
             printf("WstGLCreateNativeWindow: failed to open DRI device\n");
             return NULL;
         }
 
-        gbm = gbm_create_device(drm.fd);
+        gbm = gbm_create_device(fd);
         if (!gbm) {
             printf("WstGLCreateNativeWindow: failed to create GBM device for DRI\n");
             return NULL;
         }
+
+#ifdef DRM
+        b->drm.fd = fd;
+        b->gbm = gbm;
+#endif
 
         if (!extensions) {
                 extensions = (const char *) eglQueryString(
@@ -1589,8 +1680,8 @@ static PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display = NULL;
    }
 
    // Initialize display
-   b= eglInitialize( renderer->eglDisplay, &major, &minor );
-   if ( !b )
+   b1= eglInitialize( renderer->eglDisplay, &major, &minor );
+   if ( !b1 )
    {
       printf("wstRenderGLSetupEGL: unable to initialize EGL display\n" );
       goto exit;
@@ -1598,8 +1689,8 @@ static PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display = NULL;
    printf("wstRenderGLSetupEGL: eglInitiialize: major: %d minor: %d\n", major, minor );
 
    // Get number of available configurations
-   b= eglGetConfigs( renderer->eglDisplay, NULL, 0, &configCount );
-   if ( !b )
+   b1= eglGetConfigs( renderer->eglDisplay, NULL, 0, &configCount );
+   if ( !b1 )
    {
       printf("wstRendererGLSetupEGL: unable to get count of EGL configurations: %X\n", eglGetError() );
       goto exit;
@@ -1634,8 +1725,8 @@ static PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display = NULL;
 
     
    // Get a list of configurations that meet or exceed our requirements
-   b= eglChooseConfig( renderer->eglDisplay, attr, eglConfigs, configCount, &n);
-   if ( !b || !n)
+   b1= eglChooseConfig( renderer->eglDisplay, attr, eglConfigs, configCount, &n);
+   if ( !b1 || !n)
    {
       printf("wstRendererGLSetupEGL: eglChooseConfig failed: %X\n", eglGetError() );
       goto exit;
@@ -2503,7 +2594,7 @@ static void wstRendererUpdateScene( WstRenderer *renderer )
    #if defined (WESTEROS_PLATFORM_EMBEDDED) || defined (WESTEROS_HAVE_WAYLAND_EGL)
    eglSwapBuffers(rendererGL->eglDisplay, rendererGL->eglSurface);
 
-        if (drmModePageFlip(drm.fd, drm.crtc_id,
+        if (drmModePageFlip(b->drm.fd, output->crtc_id,
                             output->next->fb_id,
                             DRM_MODE_PAGE_FLIP_EVENT, output) < 0) {
                 printf("queueing pageflip failed: \n");
@@ -2714,8 +2805,6 @@ static float wstRendererSurfaceGetZOrder( WstRenderer *renderer, WstRenderSurfac
    return zLevel;
 }
 
-extern "C"
-{
 
 int renderer_init( WstRenderer *renderer, int argc, char **argv )
 {
@@ -2745,9 +2834,433 @@ int renderer_init( WstRenderer *renderer, int argc, char **argv )
       rc= -1;
    }
 
+#ifdef DRM
+//        b->base.destroy = drm_destroy;
+//        b->base.restore = drm_restore;
+
+        drmModeConnector *connector;
+        drmModeRes *resources;
+        int i;
+        int x = 0, y = 0;
+        uint32_t fb_id;
+
+        resources = drmModeGetResources(b->drm.fd);
+        if (!resources) {
+                printf("drmModeGetResources failed\n");
+                return -1;
+        }
+
+        b->crtcs = (uint32_t*)calloc(resources->count_crtcs, sizeof(uint32_t));
+        if (!b->crtcs) {
+                drmModeFreeResources(resources);
+                return -1;
+        }
+
+        b->min_width  = resources->min_width;
+        b->max_width  = resources->max_width;
+        b->min_height = resources->min_height;
+        b->max_height = resources->max_height;
+
+        b->num_crtcs = resources->count_crtcs;
+        memcpy(b->crtcs, resources->crtcs, sizeof(uint32_t) * b->num_crtcs);
+
+        for (i = 0; i < resources->count_connectors; i++) {
+                connector = drmModeGetConnector(b->drm.fd,
+                                                resources->connectors[i]);
+                if (connector == NULL)
+                        continue;
+
+                if (connector->connection == DRM_MODE_CONNECTED) {
+                        if (create_output(b, resources,
+                                                        connector, x, y) < 0) {
+                                drmModeFreeConnector(connector);
+                                continue;
+                        }
+
+/*                        x += container_of(b->compositor->output_list.prev,
+                                          struct weston_output,
+                                          link)->width;*/
+                }
+
+                drmModeFreeConnector(connector);
+        }
+
+        fb_id = output->current->fb_id;
+        if (drmModePageFlip(b->drm.fd, output->crtc_id, fb_id,
+                            DRM_MODE_PAGE_FLIP_EVENT, output) < 0) 
+            printf("drmModePageFlip failed\n");
+#endif
+
 exit:
    
    return 0;
 }
 
+#ifdef DRM
+extern "C"
+{
+static int
+drm_subpixel_to_wayland(int drm_value)
+{
+        switch (drm_value) {
+        default:
+        case DRM_MODE_SUBPIXEL_UNKNOWN:
+                return WL_OUTPUT_SUBPIXEL_UNKNOWN;
+        case DRM_MODE_SUBPIXEL_NONE:
+                return WL_OUTPUT_SUBPIXEL_NONE;
+        case DRM_MODE_SUBPIXEL_HORIZONTAL_RGB:
+                return WL_OUTPUT_SUBPIXEL_HORIZONTAL_RGB;
+        case DRM_MODE_SUBPIXEL_HORIZONTAL_BGR:
+                return WL_OUTPUT_SUBPIXEL_HORIZONTAL_BGR;
+        case DRM_MODE_SUBPIXEL_VERTICAL_RGB:
+                return WL_OUTPUT_SUBPIXEL_VERTICAL_RGB;
+        case DRM_MODE_SUBPIXEL_VERTICAL_BGR:
+                return WL_OUTPUT_SUBPIXEL_VERTICAL_BGR;
+        }
 }
+
+static drmModePropertyPtr
+drm_get_prop(int fd, drmModeConnectorPtr connector, const char *name)
+{
+        drmModePropertyPtr props;
+        int i;
+
+        for (i = 0; i < connector->count_props; i++) {
+                props = drmModeGetProperty(fd, connector->props[i]);
+                if (!props)
+                        continue;
+
+                if (!strcmp(props->name, name))
+                        return props;
+
+                drmModeFreeProperty(props);
+        }
+
+        return NULL;
+}
+
+static int
+connector_get_current_mode(drmModeConnector *connector, int drm_fd,
+                           drmModeModeInfo *mode)
+{
+        drmModeEncoder *encoder;
+        drmModeCrtc *crtc;
+
+        /* Get the current mode on the crtc that's currently driving
+         * this connector. */
+        encoder = drmModeGetEncoder(drm_fd, connector->encoder_id);
+        memset(mode, 0, sizeof *mode);
+        if (encoder != NULL) {
+                crtc = drmModeGetCrtc(drm_fd, encoder->crtc_id);
+                drmModeFreeEncoder(encoder);
+                if (crtc == NULL)
+                        return -1;
+                if (crtc->mode_valid)
+                        *mode = crtc->mode;
+                drmModeFreeCrtc(crtc);
+        }
+
+        return 0;
+}
+#if 0
+static struct drm_mode *
+drm_output_choose_initial_mode(struct drm_output *output,
+                               enum output_config kind,
+                               int width, int height,
+                               const drmModeModeInfo *current_mode,
+                               const drmModeModeInfo *modeline)
+{
+        struct drm_mode *preferred = NULL;
+        struct drm_mode *current = NULL;
+        struct drm_mode *configured = NULL;
+        struct drm_mode *best = NULL;
+        struct drm_mode *drm_mode;
+
+        wl_list_for_each_reverse(drm_mode, &output->base.mode_list, base.link) {
+                if (kind == OUTPUT_CONFIG_MODE &&
+                    width == drm_mode->base.width &&
+                    height == drm_mode->base.height)
+                        configured = drm_mode;
+
+                if (memcmp(&current_mode, &drm_mode->mode_info,
+                           sizeof *current_mode) == 0)
+                        current = drm_mode;
+
+                if (drm_mode->base.flags & WL_OUTPUT_MODE_PREFERRED)
+                        preferred = drm_mode;
+
+                best = drm_mode;
+        }
+
+        if (kind == OUTPUT_CONFIG_MODELINE) {
+                configured = drm_output_add_mode(output, modeline);
+                if (!configured)
+                        return NULL;
+        }
+
+        if (current == NULL && current_mode->clock != 0) {
+                current = drm_output_add_mode(output, current_mode);
+                if (!current)
+                        return NULL;
+        }
+
+        if (kind == OUTPUT_CONFIG_CURRENT)
+                configured = current;
+
+        if (option_current_mode && current)
+                return current;
+
+        if (configured)
+                return configured;
+
+        if (preferred)
+                return preferred;
+        if (current)
+                return current;
+
+        if (best)
+                return best;
+
+        printf("no available modes for %s\n", output->base.name);
+        return NULL;
+}
+static void
+edid_parse_string(const uint8_t *data, char text[])
+{
+        int i;
+        int replaced = 0;
+
+        /* this is always 12 bytes, but we can't guarantee it's null
+         * terminated or not junk. */
+        strncpy(text, (const char *) data, 12);
+
+        /* remove insane chars */
+        for (i = 0; text[i] != '\0'; i++) {
+                if (text[i] == '\n' ||
+                    text[i] == '\r') {
+                        text[i] = '\0';
+                        break;
+                }
+        }
+
+        /* ensure string is printable */
+        for (i = 0; text[i] != '\0'; i++) {
+                if (!isprint(text[i])) {
+                        text[i] = '-';
+                        replaced++;
+                }
+        }
+
+        /* if the string is random junk, ignore the string */
+        if (replaced > 4)
+                text[0] = '\0';
+}
+
+#define EDID_DESCRIPTOR_ALPHANUMERIC_DATA_STRING        0xfe
+#define EDID_DESCRIPTOR_DISPLAY_PRODUCT_NAME            0xfc
+#define EDID_DESCRIPTOR_DISPLAY_PRODUCT_SERIAL_NUMBER   0xff
+#define EDID_OFFSET_DATA_BLOCKS                         0x36
+#define EDID_OFFSET_LAST_BLOCK                          0x6c
+#define EDID_OFFSET_PNPID                               0x08
+#define EDID_OFFSET_SERIAL                              0x0c
+
+static int
+edid_parse(struct drm_edid *edid, const uint8_t *data, size_t length)
+{
+        int i;
+        uint32_t serial_number;
+
+        /* check header */
+        if (length < 128)
+                return -1;
+        if (data[0] != 0x00 || data[1] != 0xff)
+                return -1;
+
+        /* decode the PNP ID from three 5 bit words packed into 2 bytes
+         * /--08--\/--09--\
+         * 7654321076543210
+         * |\---/\---/\---/
+         * R  C1   C2   C3 */
+        edid->pnp_id[0] = 'A' + ((data[EDID_OFFSET_PNPID + 0] & 0x7c) / 4) - 1;
+        edid->pnp_id[1] = 'A' + ((data[EDID_OFFSET_PNPID + 0] & 0x3) * 8) + ((data[EDID_OFFSET_PNPID + 1] & 0xe0) / 32) - 1;
+        edid->pnp_id[2] = 'A' + (data[EDID_OFFSET_PNPID + 1] & 0x1f) - 1;
+        edid->pnp_id[3] = '\0';
+
+        /* maybe there isn't a ASCII serial number descriptor, so use this instead */
+        serial_number = (uint32_t) data[EDID_OFFSET_SERIAL + 0];
+        serial_number += (uint32_t) data[EDID_OFFSET_SERIAL + 1] * 0x100;
+        serial_number += (uint32_t) data[EDID_OFFSET_SERIAL + 2] * 0x10000;
+        serial_number += (uint32_t) data[EDID_OFFSET_SERIAL + 3] * 0x1000000;
+        if (serial_number > 0)
+                sprintf(edid->serial_number, "%lu", (unsigned long) serial_number);
+
+        /* parse EDID data */
+        for (i = EDID_OFFSET_DATA_BLOCKS;
+             i <= EDID_OFFSET_LAST_BLOCK;
+             i += 18) {
+                /* ignore pixel clock data */
+                if (data[i] != 0)
+                        continue;
+                if (data[i+2] != 0)
+                        continue;
+
+                /* any useful blocks? */
+                if (data[i+3] == EDID_DESCRIPTOR_DISPLAY_PRODUCT_NAME) {
+                        edid_parse_string(&data[i+5],
+                                          edid->monitor_name);
+                } else if (data[i+3] == EDID_DESCRIPTOR_DISPLAY_PRODUCT_SERIAL_NUMBER) {
+                        edid_parse_string(&data[i+5],
+                                          edid->serial_number);
+                } else if (data[i+3] == EDID_DESCRIPTOR_ALPHANUMERIC_DATA_STRING) {
+                        edid_parse_string(&data[i+5],
+                                          edid->eisa_id);
+                }
+        }
+        return 0;
+}
+
+static void
+find_and_parse_output_edid(struct drm_backend *b,
+                           struct drm_output *output,
+                           drmModeConnector *connector)
+{
+        drmModePropertyBlobPtr edid_blob = NULL;
+        drmModePropertyPtr property;
+        int i;
+        int rc;
+
+        for (i = 0; i < connector->count_props && !edid_blob; i++) {
+                property = drmModeGetProperty(b->drm.fd, connector->props[i]);
+                if (!property)
+                        continue;
+                if ((property->flags & DRM_MODE_PROP_BLOB) &&
+                    !strcmp(property->name, "EDID")) {
+                        edid_blob = drmModeGetPropertyBlob(b->drm.fd,
+                                                           connector->prop_values[i]);
+                }
+                drmModeFreeProperty(property);
+        }
+        if (!edid_blob)
+                return;
+
+        rc = edid_parse(&output->edid,
+                        edid_blob->data,
+                        edid_blob->length);
+        if (!rc) {
+                printf("EDID data '%s', '%s', '%s'\n",
+                           output->edid.pnp_id,
+                           output->edid.monitor_name,
+                           output->edid.serial_number);
+                if (output->edid.pnp_id[0] != '\0')
+                        output->base.make = output->edid.pnp_id;
+                if (output->edid.monitor_name[0] != '\0')
+                        output->base.model = output->edid.monitor_name;
+                if (output->edid.serial_number[0] != '\0')
+                        output->base.serial_number = output->edid.serial_number;
+        }
+        drmModeFreePropertyBlob(edid_blob);
+}
+#endif
+
+static int create_output(struct drm_backend *b,
+                            drmModeRes *resources,
+                            drmModeConnector *connector,
+                            int x, int y){
+        struct drm_mode *drm_mode, *next, *current;
+        drmModeModeInfo crtc_mode, modeline;
+        int i, width, height, scale, flags;
+
+
+        drmModeEncoder *encoder;
+        uint32_t possible_crtcs;
+        int j;
+//        enum output_config config;
+
+	output = (drm_output*)calloc(1, sizeof *output);
+	if (output == NULL)
+		return -1;
+
+        for (j = 0; j < connector->count_encoders; j++) {
+                encoder = drmModeGetEncoder(b->drm.fd, connector->encoders[j]);
+                if (!encoder){ 
+                        printf("Failed to get encoder.\n");
+                        break;
+                }
+                
+                possible_crtcs = encoder->possible_crtcs;
+                drmModeFreeEncoder(encoder);
+
+                for (i = 0; i < resources->count_crtcs; i++) {
+                        if (possible_crtcs & (1 << i) &&
+                            !(b->crtc_allocator & (1 << resources->crtcs[i])))
+                                break;
+                }
+        }
+
+/*        output->base.subpixel = drm_subpixel_to_wayland(connector->subpixel);
+        output->base.name = make_connector_name(connector);
+        output->base.make = "unknown";
+        output->base.model = "unknown";
+        output->base.serial_number = "unknown";
+        output->format = b->format;
+        wl_list_init(&output->base.mode_list);
+*/
+        output->crtc_id = resources->crtcs[i];
+        output->pipe = i;
+        b->crtc_allocator |= (1 << output->crtc_id);
+        output->connector_id = connector->connector_id;
+        b->connector_allocator |= (1 << output->connector_id);
+
+//        config = OUTPUT_CONFIG_PREFERRED;
+        output->original_crtc = drmModeGetCrtc(b->drm.fd, output->crtc_id);
+        output->dpms_prop = drm_get_prop(b->drm.fd, connector, "DPMS");
+
+        if (connector_get_current_mode(connector, b->drm.fd, &crtc_mode) < 0)
+                goto err_free;
+
+/*        for (i = 0; i < connector->count_modes; i++) {
+                drm_mode = drm_output_add_mode(output, &connector->modes[i]);
+                if (!drm_mode)
+                        goto err_free;
+        }
+
+        current = drm_output_choose_initial_mode(output, config,
+                                                 width, height,
+                                                 &crtc_mode, &modeline);
+
+        if(!current)
+            goto err;
+
+        output->base.current_mode = &current->base;
+        output->base.current_mode->flags |= WL_OUTPUT_MODE_CURRENT;
+*/
+        flags = GBM_BO_USE_CURSOR | GBM_BO_USE_WRITE;
+
+        for (i = 0; i < 2; i++) {
+                if (output->cursor_bo[i])
+                        continue;
+
+                output->cursor_bo[i] =
+                        gbm_bo_create(b->gbm, b->cursor_width, b->cursor_height,
+                                GBM_FORMAT_ARGB8888, flags);
+        }
+
+        if (output->cursor_bo[0] == NULL || output->cursor_bo[1] == NULL) {
+                printf("cursor buffers unavailable, using gl cursors\n");
+                b->cursors_are_broken = 1;
+        }
+/*
+        find_and_parse_output_edid(b, output, connector);
+        if (connector->connector_type == DRM_MODE_CONNECTOR_LVDS)
+                output->base.connection_internal = 1;
+*/
+err_free:
+	drmModeFreeCrtc(output->original_crtc);
+	b->crtc_allocator &= ~(1 << output->crtc_id);
+	b->connector_allocator &= ~(1 << output->connector_id);
+	free(output);
+
+	return -1;
+}
+}
+#endif
