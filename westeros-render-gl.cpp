@@ -34,6 +34,8 @@
 
 #if defined (WESTEROS_PLATFORM_EMBEDDED)
   #include "westeros-gl.h"
+  #include <gbm.h> //SIVA
+  #include <fcntl.h> //SIVA
 #endif
 
 #if defined (WESTEROS_PLATFORM_RPI)
@@ -50,6 +52,17 @@
 #endif
 
 #include <vector>
+
+//SIVA: DRM support 
+#define DRM
+
+#ifdef DRM
+extern "C" {
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+#include <drm_fourcc.h>
+}
+#endif
 
 //#define WST_DEBUG
 
@@ -224,6 +237,98 @@ typedef struct _WstRendererGL
    std::vector<WstRenderSurface*> surfaces;
 } WstRendererGL;
 
+#ifdef DRM
+extern "C"
+{
+struct drm_backend {
+        struct {
+                int id;
+                int fd;
+                char *filename;
+        } drm;
+        struct gbm_device *gbm;
+        uint32_t *crtcs;
+        int num_crtcs;
+        uint32_t crtc_allocator;
+        uint32_t connector_allocator;
+        struct wl_listener session_listener;
+        uint32_t format;
+        uint32_t min_width, max_width;
+        uint32_t min_height, max_height;
+        int no_addfb2;
+
+        struct wl_list sprite_list;
+        int sprites_are_broken;
+        int sprites_hidden;
+
+        int cursors_are_broken;
+
+        int use_pixman;
+
+        uint32_t prev_state;
+
+
+        int32_t cursor_width;
+        int32_t cursor_height;
+};
+
+struct drm_edid {
+	char eisa_id[13];
+	char monitor_name[13];
+	char pnp_id[5];
+	char serial_number[13];
+};
+
+struct drm_output {
+	uint32_t crtc_id;
+	int pipe;
+	uint32_t connector_id;
+	drmModeCrtcPtr original_crtc;
+	struct drm_edid edid;
+	drmModePropertyPtr dpms_prop;
+	uint32_t format;
+
+
+	int vblank_pending;
+	int page_flip_pending;
+	int destroy_pending;
+
+	struct gbm_surface *surface;
+	struct gbm_bo *cursor_bo[2];
+	int current_cursor;
+	struct drm_fb *current, *next;
+	struct backlight *backlight;
+
+	struct drm_fb *dumb[2];
+//	pixman_image_t *image[2];
+	int current_image;
+//	pixman_region32_t previous_damage;
+
+	struct vaapi_recorder *recorder;
+	struct wl_listener recorder_frame_listener;
+};
+
+struct drm_fb {
+	struct drm_output *output;
+	uint32_t fb_id, stride, handle, size;
+	int fd;
+	int is_client_buffer;
+	struct wl_resource *buffer;
+
+	/* Used by gbm fbs */
+	struct gbm_bo *bo;
+
+	/* Used by dumb fbs */
+	void *map;
+};
+
+static int create_output(struct drm_backend *b,
+                            drmModeRes *resources,
+                            drmModeConnector *connector,
+                            int x, int y);
+}
+#endif
+
 static WstRendererGL* wstRendererGLCreate( int width, int height );
 static void wstRendererGLDestroy( WstRendererGL *renderer );
 static WstRenderSurface *wstRenderGLCreateSurface(WstRendererGL *renderer);
@@ -256,9 +361,115 @@ static WstShader* wstCreateShaderForClass( WstShaderClass shaderClass );
 static void wstDestroyShader( WstRendererGL *renderer, WstShader *shader );
 static unsigned int wstCreateGLShader(const char *pShaderSource, bool isVertexShader );
 
+#ifdef DRM
+   struct drm_backend *b;
+   struct drm_output *output;
+
+static void
+drm_fb_set_buffer(struct drm_fb *fb, struct wl_resource *buffer)
+{
+	assert(fb->buffer == NULL);
+
+	fb->is_client_buffer = 1;
+
+	fb->buffer = buffer;
+}
+
+static void
+drm_fb_destroy_callback(struct gbm_bo *bo, void *data)
+{
+	struct drm_fb *fb = (struct drm_fb*)data;
+	struct gbm_device *gbm = gbm_bo_get_device(bo);
+
+	if (fb->fb_id)
+		drmModeRmFB(gbm_device_get_fd(gbm), fb->fb_id);
+
+        fb->buffer = NULL;
+
+	free(data);
+}
+
+static struct drm_fb *
+drm_fb_get_from_bo(struct gbm_bo *bo,
+		   struct drm_backend *backend, uint32_t format)
+{
+	struct drm_fb *fb = (struct drm_fb*)gbm_bo_get_user_data(bo);
+	uint32_t width, height;
+	uint32_t handles[4], pitches[4], offsets[4];
+	int ret;
+
+	if (fb)
+		return fb;
+
+	fb = (struct drm_fb*)calloc(1, sizeof *fb);
+	if (fb == NULL)
+		return NULL;
+
+	fb->bo = bo;
+
+	width = gbm_bo_get_width(bo);
+	height = gbm_bo_get_height(bo);
+	fb->stride = gbm_bo_get_stride(bo);
+	fb->handle = gbm_bo_get_handle(bo).u32;
+	fb->size = fb->stride * height;
+	fb->fd = backend->drm.fd;
+
+	if (backend->min_width > width || width > backend->max_width ||
+	    backend->min_height > height ||
+	    height > backend->max_height) {
+		printf("bo geometry out of bounds\n");
+		goto err_free;
+	}
+
+	ret = -1;
+
+	if (format && !backend->no_addfb2) {
+		handles[0] = fb->handle;
+		pitches[0] = fb->stride;
+		offsets[0] = 0;
+
+		ret = drmModeAddFB2(backend->drm.fd, width, height,
+				    format, handles, pitches, offsets,
+				    &fb->fb_id, 0);
+		if (ret) {
+			printf("addfb2 failed: \n");
+			backend->no_addfb2 = 1;
+			backend->sprites_are_broken = 1;
+		}
+	}
+
+	if (ret)
+		ret = drmModeAddFB(backend->drm.fd, width, height, 24, 32,
+				   fb->stride, fb->handle, &fb->fb_id);
+
+	if (ret) {
+		printf("failed to create kms fb: \n");
+		goto err_free;
+	}
+
+	gbm_bo_set_user_data(bo, fb, drm_fb_destroy_callback);
+
+	return fb;
+
+err_free:
+	free(fb);
+	return NULL;
+}
+#endif
+
 static WstRendererGL* wstRendererGLCreate( WstRenderer *renderer )
 {
    WstRendererGL *rendererGL= 0;
+
+#ifdef DRM
+   int ret;
+   uint64_t cap;   
+   b = (struct drm_backend*)calloc(1, sizeof(b));
+
+   if(!b)
+        printf("DRM backend is null\n");
+   b->format = GBM_FORMAT_XRGB8888;
+#endif
    
    rendererGL= (WstRendererGL*)calloc(1, sizeof(WstRendererGL) );
    if ( rendererGL )
@@ -274,6 +485,22 @@ static WstRendererGL* wstRendererGLCreate( WstRenderer *renderer )
       
       rendererGL->renderer= renderer;
       wstRenderGLSetupEGL( rendererGL );
+
+#ifdef DRM
+     b->drm.filename = "/dev/dri/card0";
+
+        ret = drmGetCap(b->drm.fd, DRM_CAP_CURSOR_WIDTH, &cap);
+        if (ret == 0)
+                b->cursor_width = cap;
+        else
+                b->cursor_width = 64;
+
+        ret = drmGetCap(b->drm.fd, DRM_CAP_CURSOR_HEIGHT, &cap);
+        if (ret == 0)
+                b->cursor_height = cap;
+        else
+                b->cursor_height = 64;
+#endif
 
       rendererGL->eglCreateImageKHR= (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
       printf( "eglCreateImageKHR %p\n", rendererGL->eglCreateImageKHR);
@@ -751,10 +978,16 @@ static void wstRendererGLCommitShm( WstRendererGL *rendererGL, WstRenderSurface 
 static void wstRendererGLCommitWaylandEGL( WstRendererGL *rendererGL, WstRenderSurface *surface, 
                                            struct wl_resource *resource, EGLint format )
 {
+   static int i = 1;
+   char s[50];
+   FILE *fbfd = NULL;
+   void *data = NULL;
    EGLImageKHR eglImage= 0;
    EGLint value;
    EGLint attrList[3];
    int bufferWidth= 0, bufferHeight= 0;
+   struct gbm_bo *bo;
+   int pixelformat = 0;
 
    if (EGL_TRUE == rendererGL->eglQueryWaylandBufferWL( rendererGL->eglDisplay,
                                                         resource,
@@ -814,6 +1047,45 @@ static void wstRendererGLCommitWaylandEGL( WstRendererGL *rendererGL, WstRenderS
                                                   resource,
                                                   NULL // EGLInt attrList[]
                                                  );
+#if 0
+        snprintf(s, sizeof s, "/usr/bin/image%d", i);
+        fbfd = fopen(s, "w");
+        if(!fbfd){
+            printf("Can't open file device\n");
+            goto ext;
+	}
+        data = wl_resource_get_user_data(resource);
+        if(!data){
+            printf("Client buffer is null\n");
+            goto ext;
+        }
+        
+        fwrite(data, bufferWidth*4, bufferHeight, fbfd);
+        i++; //    printf("fwrite failed\n");
+ext:
+        fclose(fbfd);
+#endif
+
+#ifdef DRM        
+	bo = gbm_bo_import(b->gbm, GBM_BO_IMPORT_WL_BUFFER,
+			   resource, GBM_BO_USE_SCANOUT);
+
+	/* Unable to use the buffer for scanout */
+	if (!bo)
+		return;
+        
+	pixelformat = gbm_bo_get_format(bo);
+
+	output->next = drm_fb_get_from_bo(bo, b, pixelformat);
+	if (!output->next) {
+		gbm_bo_destroy(bo);
+		return;
+	}
+
+         data = wl_resource_get_user_data(resource);
+	 drm_fb_set_buffer(output->next, (struct wl_resource*)data);
+#endif
+
          if ( eglImage )
          {
             /*
@@ -957,7 +1229,7 @@ static void wstRendererGLCommitSB( WstRendererGL *rendererGL, WstRenderSurface *
                eglImage= rendererGL->eglCreateImageKHR( rendererGL->eglDisplay,
                                                         EGL_NO_CONTEXT,
                                                         EGL_NATIVE_PIXMAP_KHR,
-                                                        eglPixmap,
+                                                        (void*)eglPixmap,
                                                         NULL // EGLInt attrList[]
                                                        );
                if ( eglImage )
@@ -1414,14 +1686,21 @@ static bool wstRenderGLSetupEGL( WstRendererGL *renderer )
 {
    bool result= false;
    EGLint major, minor;
-   EGLBoolean b;
+   EGLBoolean b1;
    EGLint configCount;
    EGLConfig *eglConfigs= 0;
    EGLint attr[32];
    EGLint redSize, greenSize, blueSize, alphaSize, depthSize;
    EGLint ctxAttrib[3];
-   int i;
-   
+
+   int i=0, n=0;
+   EGLint format[2] = {GBM_FORMAT_XRGB8888,
+                       GBM_FORMAT_ARGB8888
+                      };
+       
+   static const char *extensions = NULL; //SIVA
+   i= 0;
+  
    if ( renderer->renderer->displayNested )
    {
       // Get EGL display from wayland display
@@ -1429,8 +1708,84 @@ static bool wstRenderGLSetupEGL( WstRendererGL *renderer )
    }
    else
    {
+#if 1
+     int fd;
+        char s[64];
+static PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display = NULL;
+    struct gbm_device *gbm;
+    int supports = 0;
+        EGLenum platform = EGL_PLATFORM_GBM_KHR;
+
+        fd = open("/dev/dri/card0", O_RDWR | FD_CLOEXEC);
+        if (fd < 0) {
+            printf("WstGLCreateNativeWindow: failed to open DRI device\n");
+            return NULL;
+        }
+
+        gbm = gbm_create_device(fd);
+        if (!gbm) {
+            printf("WstGLCreateNativeWindow: failed to create GBM device for DRI\n");
+            return NULL;
+        }
+
+#ifdef DRM
+        b->drm.fd = fd;
+        b->gbm = gbm;
+#endif
+
+        if (!extensions) {
+                extensions = (const char *) eglQueryString(
+                        EGL_NO_DISPLAY, EGL_EXTENSIONS);
+
+                if (!extensions)
+                        printf("wstRenderGLSetupEGL: EGL EXT not supported\n");
+
+                printf("Westeros-gl: EGL client extensions %c\n",
+                               extensions);
+        }
+
+        snprintf(s, sizeof s, "EGL_KHR_platform_%s", "gbm");
+        if (strstr(extensions, s)){
+                supports = 1;
+                printf("Westeros-gl: EGL_KHR_platform_gbm supported\n");
+        }
+
+        snprintf(s, sizeof s, "EGL_EXT_platform_%s", "gbm");
+        if (strstr(extensions, s)){
+                supports = 1;
+                printf("Westeros-gl: EGL_EXT_platform_gbm supported\n");
+        }
+
+        snprintf(s, sizeof s, "EGL_MESA_platform_%s", "gbm");
+        if (strstr(extensions, s)){
+                supports = 1;
+                printf("Westeros-gl: EGL_MESA_platform_gbm supported\n");
+        }
+
+       if (supports) {
+                if (!get_platform_display) {
+                        get_platform_display = (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress(
+                                        "eglGetPlatformDisplayEXT");
+
+                }
+
+                /* eglGetProcAddress can return non-NULL and still not
+                 * support the feature at runtime, so ensure the extension support checked*/
+                if (get_platform_display && platform) {
+                       renderer->eglDisplay = get_platform_display(platform,
+                                                               gbm,
+                                                               NULL);
+                }
+       }
+
+       if (!renderer->eglDisplay) {
+                printf("wstRenderGLSetupEGL: warning either no EGL_EXT_platform_base support or specific platform support falling back to eglGetDisplay.\n");
+                renderer->eglDisplay = eglGetDisplay(gbm);
+        }
+#else
       // Get default EGL display
       renderer->eglDisplay= eglGetDisplay(EGL_DEFAULT_DISPLAY);
+#endif
    }
    printf("wstRenderGLSetupEGL: eglDisplay=%p\n", renderer->eglDisplay );
    if ( renderer->eglDisplay == EGL_NO_DISPLAY )
@@ -1440,8 +1795,8 @@ static bool wstRenderGLSetupEGL( WstRendererGL *renderer )
    }
 
    // Initialize display
-   b= eglInitialize( renderer->eglDisplay, &major, &minor );
-   if ( !b )
+   b1= eglInitialize( renderer->eglDisplay, &major, &minor );
+   if ( !b1 )
    {
       printf("wstRenderGLSetupEGL: unable to initialize EGL display\n" );
       goto exit;
@@ -1449,8 +1804,8 @@ static bool wstRenderGLSetupEGL( WstRendererGL *renderer )
    printf("wstRenderGLSetupEGL: eglInitiialize: major: %d minor: %d\n", major, minor );
 
    // Get number of available configurations
-   b= eglGetConfigs( renderer->eglDisplay, NULL, 0, &configCount );
-   if ( !b )
+   b1= eglGetConfigs( renderer->eglDisplay, NULL, 0, &configCount );
+   if ( !b1 )
    {
       printf("wstRendererGLSetupEGL: unable to get count of EGL configurations: %X\n", eglGetError() );
       goto exit;
@@ -1464,6 +1819,7 @@ static bool wstRenderGLSetupEGL( WstRendererGL *renderer )
       goto exit;
    }
 
+#if 0 // SIVA
    i= 0;
    attr[i++]= EGL_RED_SIZE;
    attr[i++]= RED_SIZE;
@@ -1479,20 +1835,40 @@ static bool wstRenderGLSetupEGL( WstRendererGL *renderer )
    attr[i++]= EGL_WINDOW_BIT;
    attr[i++]= EGL_RENDERABLE_TYPE;
    attr[i++]= EGL_OPENGL_ES2_BIT;
-   attr[i++]= EGL_NONE;
+#endif
+   attr[0]= EGL_NONE;
+
     
    // Get a list of configurations that meet or exceed our requirements
-   b= eglChooseConfig( renderer->eglDisplay, attr, eglConfigs, configCount, &configCount );
-   if ( !b )
+   b1= eglChooseConfig( renderer->eglDisplay, attr, eglConfigs, configCount, &n);
+   if ( !b1 || !n)
    {
       printf("wstRendererGLSetupEGL: eglChooseConfig failed: %X\n", eglGetError() );
       goto exit;
    }
-   printf("wstRendererGLSetupEGL: eglChooseConfig: matching configurations: %d\n", configCount );
+
+   printf("wstRendererGLSetupEGL: eglChooseConfig: matching configurations: %d\n", n);
+        for (i = 0; i < n; ++i) {
+                EGLint id;
+
+                if (!eglGetConfigAttrib(renderer->eglDisplay,
+                                eglConfigs[i], EGL_NATIVE_VISUAL_ID,
+                                &id))
+                        continue;
+
+                if (id == format[0] || id == format[1])
+                        break;
+        }
+   
     
+#if 0 
    // Choose a suitable configuration
    for( i= 0; i < configCount; ++i )
    {
+      eglGetConfigAttrib(renderer->eglDisplay, eglConfigs[i], EGL_BUFFER_SIZE, &redSize );
+      if (redSize == 32)
+          break;
+
       eglGetConfigAttrib( renderer->eglDisplay, eglConfigs[i], EGL_RED_SIZE, &redSize );
       eglGetConfigAttrib( renderer->eglDisplay, eglConfigs[i], EGL_GREEN_SIZE, &greenSize );
       eglGetConfigAttrib( renderer->eglDisplay, eglConfigs[i], EGL_BLUE_SIZE, &blueSize );
@@ -1516,7 +1892,12 @@ static bool wstRenderGLSetupEGL( WstRendererGL *renderer )
       printf("wstRendererGLSetupEGL: no suitable configuration available\n");
       goto exit;
    }
+#endif
+   printf( "choosing config %d\n", i);
    renderer->eglConfig= eglConfigs[i];
+
+   //SIVA
+   wl_display_add_shm_format(renderer->renderer->display, WL_SHM_FORMAT_RGB565);
 
    // If we are doing nested composition, create a wayland egl window otherwise
    // create a native egl window.
@@ -1539,11 +1920,29 @@ static bool wstRenderGLSetupEGL( WstRendererGL *renderer )
 
    if ( renderer->nativeWindow )
    {
+#if 1
+      static PFNEGLCREATEPLATFORMWINDOWSURFACEEXTPROC create_platform_window = NULL;
+
+      if (strstr(extensions, "EGL_EXT_platform_base"))
+                create_platform_window =
+                        (PFNEGLCREATEPLATFORMWINDOWSURFACEEXTPROC)eglGetProcAddress("eglCreatePlatformWindowSurfaceEXT");
+      else
+                printf("warning: EGL_EXT_platform_base not supported.\n");
+
+      if(!create_platform_window)
+      renderer->eglSurface= create_platform_window(renderer->eglDisplay,
+                                                   renderer->eglConfig,
+                                                   renderer->nativeWindow,
+                                                   NULL);
+      else{
+                printf("warning: create_platform_window is null, falling back\n");
+#endif
       // Create an EGL window surface
       renderer->eglSurface= eglCreateWindowSurface( renderer->eglDisplay, 
                                                     renderer->eglConfig, 
                                                     (EGLNativeWindowType)renderer->nativeWindow,
                                                     NULL );
+      } //SIVA
       printf("wstRenderGLSetupEGL: eglSurface %p\n", renderer->eglSurface );
    }
 
@@ -1551,6 +1950,14 @@ static bool wstRenderGLSetupEGL( WstRendererGL *renderer )
    ctxAttrib[1]= 2; // ES2
    ctxAttrib[2]= EGL_NONE;
 
+   if (!eglBindAPI(EGL_OPENGL_ES_API))
+      printf("wstRenderGLSetupEGL: failed to bind EGL_OPENGL_ES_API\n");
+
+   if (strstr(extensions, "EGL_MESA_configless_context"))
+      *eglConfigs = EGL_NO_CONFIG_MESA;
+   else
+      eglConfigs = &renderer->eglConfig; 
+ 
    // Create an EGL context
    renderer->eglContext= eglCreateContext( renderer->eglDisplay, renderer->eglConfig, EGL_NO_CONTEXT, ctxAttrib );
    if ( renderer->eglContext == EGL_NO_CONTEXT )
@@ -1560,14 +1967,16 @@ static bool wstRenderGLSetupEGL( WstRendererGL *renderer )
    }
    printf("wstRendererGLSetupEGL: eglContext %p\n", renderer->eglContext );
 
-   eglMakeCurrent( renderer->eglDisplay, renderer->eglSurface, renderer->eglSurface, renderer->eglContext );
+   if(!eglMakeCurrent( renderer->eglDisplay, renderer->eglSurface, renderer->eglSurface, renderer->eglContext ))
+   {
+      printf("wstRendererGLSetupEGL: Failed to make EGL context current %X\n", eglGetError());
+   }
    
-   eglSwapInterval( renderer->eglDisplay, 1 );
+   //eglSwapInterval( renderer->eglDisplay, 1 );
    
    result= true;
 
 exit:
-
    if ( eglConfigs )
    {
       //Crashes in free sometimes.  Why?
@@ -2299,6 +2708,12 @@ static void wstRendererUpdateScene( WstRenderer *renderer )
 
    #if defined (WESTEROS_PLATFORM_EMBEDDED) || defined (WESTEROS_HAVE_WAYLAND_EGL)
    eglSwapBuffers(rendererGL->eglDisplay, rendererGL->eglSurface);
+
+        if (drmModePageFlip(b->drm.fd, output->crtc_id,
+                            output->next->fb_id,
+                            DRM_MODE_PAGE_FLIP_EVENT, output) < 0) {
+                printf("queueing pageflip failed: \n");
+        }
    #endif
 }
 
@@ -2505,8 +2920,6 @@ static float wstRendererSurfaceGetZOrder( WstRenderer *renderer, WstRenderSurfac
    return zLevel;
 }
 
-extern "C"
-{
 
 int renderer_init( WstRenderer *renderer, int argc, char **argv )
 {
@@ -2536,10 +2949,195 @@ int renderer_init( WstRenderer *renderer, int argc, char **argv )
       rc= -1;
    }
 
+#ifdef DRM
+        drmModeConnector *connector;
+        drmModeRes *resources;
+        int i;
+        int x = 0, y = 0;
+        uint32_t fb_id;
+
+        resources = drmModeGetResources(b->drm.fd);
+        if (!resources) {
+                printf("drmModeGetResources failed\n");
+                return -1;
+        }
+
+        b->crtcs = (uint32_t*)calloc(resources->count_crtcs, sizeof(uint32_t));
+        if (!b->crtcs) {
+                drmModeFreeResources(resources);
+                return -1;
+        }
+
+        b->min_width  = resources->min_width;
+        b->max_width  = resources->max_width;
+        b->min_height = resources->min_height;
+        b->max_height = resources->max_height;
+
+        b->num_crtcs = resources->count_crtcs;
+        memcpy(b->crtcs, resources->crtcs, sizeof(uint32_t) * b->num_crtcs);
+
+        for (i = 0; i < resources->count_connectors; i++) {
+                connector = drmModeGetConnector(b->drm.fd,
+                                                resources->connectors[i]);
+                if (connector == NULL)
+                        continue;
+
+                if (connector->connection == DRM_MODE_CONNECTED) {
+                        if (create_output(b, resources,
+                                                        connector, x, y) < 0) {
+                                drmModeFreeConnector(connector);
+                                continue;
+                        }
+
+                }
+
+                drmModeFreeConnector(connector);
+        }
+
+#endif
+
 exit:
    
    return 0;
 }
 
+#ifdef DRM
+extern "C"
+{
+static int
+drm_subpixel_to_wayland(int drm_value)
+{
+        switch (drm_value) {
+        default:
+        case DRM_MODE_SUBPIXEL_UNKNOWN:
+                return WL_OUTPUT_SUBPIXEL_UNKNOWN;
+        case DRM_MODE_SUBPIXEL_NONE:
+                return WL_OUTPUT_SUBPIXEL_NONE;
+        case DRM_MODE_SUBPIXEL_HORIZONTAL_RGB:
+                return WL_OUTPUT_SUBPIXEL_HORIZONTAL_RGB;
+        case DRM_MODE_SUBPIXEL_HORIZONTAL_BGR:
+                return WL_OUTPUT_SUBPIXEL_HORIZONTAL_BGR;
+        case DRM_MODE_SUBPIXEL_VERTICAL_RGB:
+                return WL_OUTPUT_SUBPIXEL_VERTICAL_RGB;
+        case DRM_MODE_SUBPIXEL_VERTICAL_BGR:
+                return WL_OUTPUT_SUBPIXEL_VERTICAL_BGR;
+        }
 }
 
+static drmModePropertyPtr
+drm_get_prop(int fd, drmModeConnectorPtr connector, const char *name)
+{
+        drmModePropertyPtr props;
+        int i;
+
+        for (i = 0; i < connector->count_props; i++) {
+                props = drmModeGetProperty(fd, connector->props[i]);
+                if (!props)
+                        continue;
+
+                if (!strcmp(props->name, name))
+                        return props;
+
+                drmModeFreeProperty(props);
+        }
+
+        return NULL;
+}
+
+static int
+connector_get_current_mode(drmModeConnector *connector, int drm_fd,
+                           drmModeModeInfo *mode)
+{
+        drmModeEncoder *encoder;
+        drmModeCrtc *crtc;
+
+        /* Get the current mode on the crtc that's currently driving
+         * this connector. */
+        encoder = drmModeGetEncoder(drm_fd, connector->encoder_id);
+        memset(mode, 0, sizeof *mode);
+        if (encoder != NULL) {
+                crtc = drmModeGetCrtc(drm_fd, encoder->crtc_id);
+                drmModeFreeEncoder(encoder);
+                if (crtc == NULL)
+                        return -1;
+                if (crtc->mode_valid)
+                        *mode = crtc->mode;
+                drmModeFreeCrtc(crtc);
+        }
+
+        return 0;
+}
+
+static int create_output(struct drm_backend *b,
+                            drmModeRes *resources,
+                            drmModeConnector *connector,
+                            int x, int y){
+        struct drm_mode *drm_mode, *next, *current;
+        drmModeModeInfo crtc_mode, modeline;
+        int i, width, height, scale, flags;
+
+
+        drmModeEncoder *encoder;
+        uint32_t possible_crtcs;
+        int j;
+
+	output = (drm_output*)calloc(1, sizeof *output);
+	if (output == NULL)
+		return -1;
+
+        for (j = 0; j < connector->count_encoders; j++) {
+                encoder = drmModeGetEncoder(b->drm.fd, connector->encoders[j]);
+                if (!encoder){ 
+                        printf("Failed to get encoder.\n");
+                        break;
+                }
+                
+                possible_crtcs = encoder->possible_crtcs;
+                drmModeFreeEncoder(encoder);
+
+                for (i = 0; i < resources->count_crtcs; i++) {
+                        if (possible_crtcs & (1 << i) &&
+                            !(b->crtc_allocator & (1 << resources->crtcs[i])))
+                                break;
+                }
+        }
+
+       output->crtc_id = resources->crtcs[i];
+        output->pipe = i;
+        b->crtc_allocator |= (1 << output->crtc_id);
+        output->connector_id = connector->connector_id;
+        b->connector_allocator |= (1 << output->connector_id);
+
+//        config = OUTPUT_CONFIG_PREFERRED;
+        output->original_crtc = drmModeGetCrtc(b->drm.fd, output->crtc_id);
+        output->dpms_prop = drm_get_prop(b->drm.fd, connector, "DPMS");
+
+        if (connector_get_current_mode(connector, b->drm.fd, &crtc_mode) < 0)
+                goto err_free;
+
+        flags = GBM_BO_USE_CURSOR | GBM_BO_USE_WRITE;
+
+        for (i = 0; i < 2; i++) {
+                if (output->cursor_bo[i])
+                        continue;
+
+                output->cursor_bo[i] =
+                        gbm_bo_create(b->gbm, b->cursor_width, b->cursor_height,
+                                GBM_FORMAT_ARGB8888, flags);
+        }
+
+        if (output->cursor_bo[0] == NULL || output->cursor_bo[1] == NULL) {
+                printf("cursor buffers unavailable, using gl cursors\n");
+                b->cursors_are_broken = 1;
+        }
+
+err_free:
+	drmModeFreeCrtc(output->original_crtc);
+	b->crtc_allocator &= ~(1 << output->crtc_id);
+	b->connector_allocator &= ~(1 << output->connector_id);
+	free(output);
+
+	return -1;
+}
+}
+#endif
